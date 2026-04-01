@@ -1,0 +1,20 @@
+# Caddy reverse proxy for UghStorage.
+# If using Cloudflare Tunnel you may not need this, but it is useful for
+# local HTTPS or as an alternative to the tunnel.
+
+:443 {
+    reverse_proxy localhost:8000
+
+    # Sensible header defaults
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+
+    # Increase body size limit to match server config (5 GB)
+    request_body {
+        max_size 5GB
+    }
+}
