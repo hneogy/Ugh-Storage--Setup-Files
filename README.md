@@ -261,7 +261,7 @@ df -h /mnt/nvme
 ```bash
 # Download UghStorage
 cd /home/pi
-git clone https://github.com/hneogy/ughstorage.git
+git clone https://github.com/hneogy/Ugh-Storage--Setup-Files.git
 cd ughstorage/server
 
 # Make the scripts executable
