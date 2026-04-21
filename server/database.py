@@ -41,6 +41,14 @@ async def _init_tables(db: aiosqlite.Connection) -> None:
     await _migrate_add_column(db, "files", "is_favorite", "BOOLEAN NOT NULL DEFAULT 0")
     await _migrate_add_column(db, "files", "is_trashed", "BOOLEAN NOT NULL DEFAULT 0")
     await _migrate_add_column(db, "files", "trashed_at", "DATETIME")
+    # HLS pre-transcode state. Values:
+    #   NULL / 'pending'      — hasn't been inspected yet
+    #   'transcoding'         — ffmpeg is currently running
+    #   'ready'               — master.m3u8 + segments exist on disk
+    #   'failed'              — ffmpeg errored; see hls_error
+    #   'unsupported'         — not a streamable video (image, doc, encrypted payload, etc.)
+    await _migrate_add_column(db, "files", "hls_status", "TEXT")
+    await _migrate_add_column(db, "files", "hls_error", "TEXT")
 
     # Share links table
     await db.execute(
@@ -57,6 +65,24 @@ async def _init_tables(db: aiosqlite.Connection) -> None:
     )
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_share_links_token ON share_links (token)"
+    )
+
+    # HLS streaming tokens — short-lived, path-scoped. AVPlayer can't inject
+    # Authorization headers on segment requests, so playback URLs carry the
+    # token in the path instead.
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hls_tokens (
+            token       TEXT PRIMARY KEY,
+            file_id     TEXT NOT NULL,
+            expires_at  DATETIME NOT NULL,
+            created_at  DATETIME NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hls_tokens_file ON hls_tokens (file_id)"
     )
 
     await db.commit()

@@ -1,0 +1,14 @@
+{
+  "latest_version": "2.1.0",
+  "git_ref": "v2.1.0",
+  "min_compatible_version": "2.1.0",
+  "published_at": "2026-04-21T20:22:03.739856+00:00",
+  "release_notes": "First signed release: multi-module Pi (storage + music + photos + video), OTA updates, provisioning tokens",
+  "modules": {
+    "music": "0.54.1",
+    "photos": "v1.140.0",
+    "video": "10.9.11"
+  },
+  "signature": "5NfqM9OGtpFc74Kx9IgTOO4VhP71aD1SIuv6al5Vlfl6QuXSIZA8QmygcueP5hNiKNX0eUV+Qh/3zSk0ciDiAg==",
+  "signing_public_key": "zZfwKtXdrY0N88hoTp9cp9THoNTWwfjNML8qE9hlrB8="
+}

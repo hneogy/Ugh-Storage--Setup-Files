@@ -19,7 +19,56 @@ echo
 # --- System dependencies ---
 echo "[1/6] Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3-pip python3-venv ffmpeg
+sudo apt-get install -y -qq python3-pip python3-venv ffmpeg git
+
+# --- OTA state directory ---
+# Persists update state across service restarts and reboots. Lives outside
+# the repo so `git checkout` during an update never touches it.
+sudo mkdir -p /var/lib/ughstorage
+sudo chown "$(whoami):$(whoami)" /var/lib/ughstorage
+
+# --- Passwordless sudo for the single command the update script needs ---
+# Scoped tight: only `systemctl restart ughstorage` without a password.
+# Everything else still requires sudo. Safer than `ALL=(ALL) NOPASSWD: ALL`.
+SUDOERS_FILE="/etc/sudoers.d/ughstorage-update"
+# Scoped tight: only `systemctl restart` / `systemctl start` / `systemctl stop`
+# / `systemctl enable` / `systemctl disable` for units whose names start with
+# `ughstorage` or `ugh-module-*`. Everything else still requires a password.
+# This lets module install scripts set up their own systemd units without
+# handing them a general root shell.
+if [ ! -f "$SUDOERS_FILE" ]; then
+    sudo tee "$SUDOERS_FILE" > /dev/null <<SUDOERS
+$(whoami) ALL=(root) NOPASSWD: /bin/systemctl restart ughstorage, \\
+    /bin/systemctl restart ughstorage.service, \\
+    /bin/systemctl start ugh-module-*, \\
+    /bin/systemctl stop ugh-module-*, \\
+    /bin/systemctl restart ugh-module-*, \\
+    /bin/systemctl enable ugh-module-*, \\
+    /bin/systemctl disable ugh-module-*, \\
+    /bin/systemctl daemon-reload, \\
+    /usr/bin/tee /etc/systemd/system/ugh-module-*.service, \\
+    /bin/rm /etc/systemd/system/ugh-module-*.service
+SUDOERS
+    sudo chmod 0440 "$SUDOERS_FILE"
+    echo "  Added module / update sudoers rules."
+fi
+
+# --- Docker (used by media modules: music / photos / video) ---
+# Storage runs natively (Python venv); media modules ship as upstream Docker
+# images so we don't carry their build-from-source maintenance burden.
+echo "[2a/6] Installing Docker..."
+if ! command -v docker &>/dev/null; then
+    # Use Docker's convenience installer — official, idempotent, supports arm64.
+    curl -fsSL https://get.docker.com | sudo sh
+    sudo systemctl enable --now docker
+    # Add the current user to the docker group so module install scripts
+    # don't need sudo for `docker` invocations.
+    sudo usermod -aG docker "$(whoami)"
+    echo "  Docker installed: $(docker --version)"
+    echo "  NOTE: log out and back in (or run 'newgrp docker') for group membership to take effect."
+else
+    echo "  Docker already installed: $(docker --version)"
+fi
 
 # --- Cloudflared ---
 echo "[2/6] Installing cloudflared..."
@@ -46,6 +95,26 @@ sudo mkdir -p "$STORAGE_DIR" "$THUMBNAIL_DIR"
 sudo chown "$(whoami):$(whoami)" "$STORAGE_DIR" "$THUMBNAIL_DIR"
 echo "  $STORAGE_DIR"
 echo "  $THUMBNAIL_DIR"
+
+# --- Module data layout ---
+# Reserved for future media modules (sprints c+). Empty today; their install
+# scripts will populate them. Created up-front so module installs don't have
+# to deal with permissions on a missing parent. Distinct from $STORAGE_DIR
+# (the user's bulk file storage) on purpose — keeps "user files" and
+# "service data" obviously separate when debugging.
+UGH_ROOT="/mnt/nvme/ughstorage"
+# Module-data dirs match each module's install-script DATA_DIR so the
+# "installed?" sentinel in modules.py lines up with where install_*.sh
+# actually writes state.
+sudo mkdir -p \
+    "$UGH_ROOT/media/music" \
+    "$UGH_ROOT/media/photos" \
+    "$UGH_ROOT/media/video" \
+    "$UGH_ROOT/module-data/music" \
+    "$UGH_ROOT/module-data/immich" \
+    "$UGH_ROOT/module-data/jellyfin"
+sudo chown -R "$(whoami):$(whoami)" "$UGH_ROOT"
+echo "  $UGH_ROOT/{media,module-data}/ (reserved for future modules)"
 
 # --- Environment file ---
 echo "[5/6] Configuring environment..."

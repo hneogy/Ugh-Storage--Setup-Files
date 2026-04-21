@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -20,14 +21,21 @@ logger = logging.getLogger("registration")
 _ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
-async def register_device(user_token: str) -> dict:
+async def register_device(user_token: str, provisioning_token: str) -> dict:
     """Register this device with Supabase via the register-device edge function.
 
     Args:
         user_token: The user's Supabase JWT (from the iOS app, passed over BLE).
+        provisioning_token: The sticker code the user typed into the iOS app
+            during setup — validated server-side against provisioning_tokens.
 
     Returns:
-        dict with keys: device_id, subdomain, tunnel_url, shared_secret
+        dict with keys: device_id, subdomain, tunnel_url, shared_secret, tunnel_token
+
+    Raises:
+        RuntimeError with a token_* code in the message when the provisioning
+        token is missing/malformed/revoked/expired/claimed-by-other. Callers
+        (ble_setup.py) surface these to the user over BLE.
     """
     url = f"{config.SUPABASE_URL}/functions/v1/register-device"
     headers = {
@@ -35,17 +43,21 @@ async def register_device(user_token: str) -> dict:
         "apikey": config.SUPABASE_ANON_KEY,
         "Content-Type": "application/json",
     }
+    payload = {"provisioning_token": provisioning_token}
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json={}) as resp:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            body_text = await resp.text()
             if resp.status != 200:
-                body = await resp.text()
                 raise RuntimeError(
-                    f"register-device failed (HTTP {resp.status}): {body}"
+                    f"register-device failed (HTTP {resp.status}): {body_text}"
                 )
-            data = await resp.json()
+            try:
+                import json as _json
+                data = _json.loads(body_text)
+            except Exception as exc:
+                raise RuntimeError(f"register-device returned non-JSON: {body_text}") from exc
 
-    # Expected shape: {device_id, subdomain, tunnel_url, shared_secret, tunnel_token}
     required_keys = ("device_id", "subdomain", "tunnel_url", "shared_secret", "tunnel_token")
     for key in required_keys:
         if key not in data:
@@ -320,7 +332,7 @@ async def send_heartbeat() -> dict:
     }
     params = {"id": f"eq.{config.DEVICE_ID}"}
     payload = {
-        "last_seen_at": "now()",
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
         "storage_total": storage_stats["storage_total"],
         "storage_used": storage_stats["storage_used"],
         "storage_free": storage_stats["storage_free"],

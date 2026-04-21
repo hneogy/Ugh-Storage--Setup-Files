@@ -1,0 +1,15 @@
+{
+  "_comment": "Example manifest. Publish the real one at a stable URL (e.g. https://raw.githubusercontent.com/<you>/ughstorage/stable/server/manifest.json) and set UGHSTORAGE_UPDATE_MANIFEST_URL on each Pi. Cut releases with bin/cut-release.py, which fills in the correct `modules` versions from install_*.sh and signs with your Ed25519 private key. Devices verify the signature against the public key baked into update_manager.py (or read from UGHSTORAGE_UPDATE_PUBLIC_KEY).",
+  "latest_version": "2.1.0",
+  "git_ref": "v2.1.0",
+  "min_compatible_version": "2.0.0",
+  "published_at": "2026-05-01T00:00:00Z",
+  "release_notes": "Bumps Navidrome to 0.55.0 and Immich to v1.145.0.",
+  "modules": {
+    "music": "0.55.0",
+    "photos": "v1.145.0",
+    "video": "10.9.11"
+  },
+  "signature": "base64-ed25519-signature-of-the-canonical-manifest-bytes",
+  "signing_public_key": "base64-ed25519-pubkey-for-human-inspection-only"
+}

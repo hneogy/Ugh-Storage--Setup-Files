@@ -1,0 +1,69 @@
+# UghStorage-owned Immich compose file.
+#
+# Based on the upstream Immich `docker-compose.yml` but trimmed to what we
+# actually need and pinned to a release we've tested. Upstream drifts frequently;
+# owning this locally means we can ship a known-good configuration without
+# chasing their breaking changes at install time.
+#
+# Variables (from adjacent .env file):
+#   IMMICH_VERSION       — pinned image tag (e.g. v1.140.0)
+#   IMMICH_PORT          — host port bound to the server container
+#   UPLOAD_LOCATION      — host path for user photos (module-data lives beside it)
+#   DB_DATA_LOCATION     — host path for Postgres data
+#   MODEL_CACHE_LOCATION — host path for ML model cache
+#   DB_PASSWORD          — randomly generated per-install
+#   DB_USERNAME          — "immich"
+#   DB_DATABASE_NAME     — "immich"
+#
+# The ML container is gated behind the `ml` compose profile so it doesn't
+# consume RAM on devices that have it toggled off. Compose invocation:
+#   docker compose --profile ml up -d   # ML enabled
+#   docker compose up -d                # ML disabled
+
+name: ugh-immich
+
+services:
+  immich-server:
+    container_name: ugh_immich_server
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION}
+    volumes:
+      - ${UPLOAD_LOCATION}:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    ports:
+      - "${IMMICH_PORT}:2283"
+    depends_on:
+      - redis
+      - database
+    restart: always
+
+  immich-machine-learning:
+    container_name: ugh_immich_ml
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION}
+    volumes:
+      - ${MODEL_CACHE_LOCATION}:/cache
+    env_file:
+      - .env
+    restart: always
+    profiles:
+      - ml
+
+  redis:
+    container_name: ugh_immich_redis
+    image: docker.io/redis:6.2-alpine
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: always
+
+  database:
+    container_name: ugh_immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.3.0-pgvectors0.2.0
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    restart: always

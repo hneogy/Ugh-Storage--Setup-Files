@@ -94,8 +94,8 @@ def _get_device_info() -> dict:
     storage_used = "0"
     try:
         stat = shutil.disk_usage("/")
-        storage_total = str(stat.total)
-        storage_used = str(stat.used)
+        storage_total = stat.total
+        storage_used = stat.used
     except Exception:
         pass
     return {
@@ -387,14 +387,37 @@ class BLEApplication:
     async def _handle_user_token_write(self, value: list[int]) -> None:
         """Handle write on USER_TOKEN characteristic.
 
-        When the iOS app writes the user's Supabase JWT here, we:
-        1. Call registration.register_device() with the token
-        2. Update REGISTRATION_STATUS with progress
-        3. Save config via registration.save_device_config()
-        4. Update SERVER_URL with the tunnel_url
+        Payload shape: JSON object `{"user_token": "...", "provisioning_token": "UGH-..."}`.
+        We accept the legacy raw-string shape (just the JWT) for backwards
+        compat with older app builds — they'll fail at the edge function with
+        a clear "provisioning_token required" error, prompting the user to
+        update.
+
+        Steps:
+        1. Parse payload, surface "registering" status
+        2. Call register_device with both tokens
+        3. Provision Cloudflare tunnel from the returned tunnel_token
+        4. Save device config locally + update SERVER_URL
+        5. Mark complete
         """
         raw = _from_byte_array(value)
         logger.info("USER_TOKEN: write received (%d bytes)", len(raw))
+
+        # Parse the new JSON shape; fall back to treating the raw bytes as a
+        # plain JWT for legacy clients (they'll get a clear error from the
+        # edge function once they hit the missing-token check).
+        user_token: str
+        provisioning_token: str = ""
+        try:
+            stripped = raw.strip()
+            if stripped.startswith("{"):
+                parsed = json.loads(stripped)
+                user_token = (parsed.get("user_token") or "").strip()
+                provisioning_token = (parsed.get("provisioning_token") or "").strip()
+            else:
+                user_token = stripped
+        except Exception:
+            user_token = raw.strip()
 
         try:
             # Step 1: Update status to registering
@@ -405,7 +428,7 @@ class BLEApplication:
             logger.info("REGISTRATION_STATUS: registering")
 
             # Step 2: Call register_device
-            result = await register_device(raw.strip())
+            result = await register_device(user_token, provisioning_token)
             logger.info("USER_TOKEN: registration response: %s", result)
 
             # Step 3: Update status to provisioning_tunnel

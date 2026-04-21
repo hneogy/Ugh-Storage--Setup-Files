@@ -10,6 +10,7 @@ load_dotenv()
 # --- Storage ---
 STORAGE_ROOT = Path(os.getenv("UGHSTORAGE_STORAGE_ROOT", "/mnt/nvme/storage"))
 THUMBNAIL_ROOT = Path(os.getenv("UGHSTORAGE_THUMBNAIL_ROOT", "/mnt/nvme/thumbnails"))
+HLS_ROOT = Path(os.getenv("UGHSTORAGE_HLS_ROOT", "/mnt/nvme/hls"))
 DATABASE_PATH = Path(os.getenv("UGHSTORAGE_DATABASE_PATH", "/mnt/nvme/ughstorage.db"))
 
 # --- Supabase ---
