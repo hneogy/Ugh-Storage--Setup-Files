@@ -14,6 +14,8 @@ import tempfile
 import time
 import uuid
 import zipfile
+
+import aiohttp
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -96,10 +98,12 @@ async def _hls_backfill_scan() -> None:
 
 
 async def _hls_token_sweep_loop() -> None:
-    """Delete expired HLS tokens once an hour. The table otherwise grows forever."""
+    """Delete expired HLS tokens every 5 min. Per-request validation already
+    rejects expired tokens (see /hls/{token}/{path}); the sweep just keeps
+    the table bounded."""
     while True:
         try:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(300)
             db = await get_db()
             now = datetime.now(timezone.utc).isoformat()
             await db.execute("DELETE FROM hls_tokens WHERE expires_at < ?", (now,))
@@ -108,6 +112,32 @@ async def _hls_token_sweep_loop() -> None:
             raise
         except Exception:
             logger.exception("HLS token sweep failed")
+
+
+async def _heartbeat_loop() -> None:
+    """Send a heartbeat to Supabase every 5 min so the iOS app's "online"
+    indicator stays fresh and the dashboard's last_seen_at advances. Skips
+    silently if the device isn't registered yet (BLE setup hasn't happened).
+    First heartbeat fires after 30s so we don't race startup."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            from registration import send_heartbeat
+            from config import DEVICE_ID
+            if DEVICE_ID:
+                await send_heartbeat()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Heartbeat failures are surfaced at warning level so systemic
+            # problems (bad credentials, Supabase schema drift, expired tokens)
+            # show up in journalctl. Transient network blips will also log
+            # but the periodic cadence keeps noise bounded.
+            logger.warning("Heartbeat failed: %s", exc)
+        try:
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            raise
 
 
 @asynccontextmanager
@@ -123,11 +153,12 @@ async def lifespan(_app: FastAPI):
     # connections.
     backfill_task = asyncio.create_task(_hls_backfill_scan())
     sweep_task = asyncio.create_task(_hls_token_sweep_loop())
+    heartbeat_task = asyncio.create_task(_heartbeat_loop())
     try:
         yield
     finally:
-        sweep_task.cancel()
-        backfill_task.cancel()
+        for t in (heartbeat_task, sweep_task, backfill_task):
+            t.cancel()
         await close_db()
 
 
@@ -211,11 +242,41 @@ class DeviceRenameRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _sanitize_path(path: str) -> str:
-    """Normalize and validate a sub-path to prevent directory traversal."""
-    cleaned = Path(path).as_posix().strip("/")
-    if ".." in cleaned.split("/"):
+    """Normalize and validate a sub-path to prevent directory traversal.
+
+    This is the lexical guard — it strips `..` segments and absolute roots so
+    a caller can safely join the result onto STORAGE_ROOT. For operations that
+    actually open the file, also call `_resolve_under_storage()` which walks
+    symlinks and rejects anything that escapes STORAGE_ROOT.
+    """
+    cleaned = Path(path).as_posix().lstrip("/").strip()
+    # Reject backslashes (Windows-style) too — they'd survive POSIX normalization.
+    if "\\" in cleaned:
         raise HTTPException(status_code=400, detail="Invalid path")
+    parts = cleaned.split("/")
+    if ".." in parts:
+        raise HTTPException(status_code=400, detail="Invalid path")
+    # Reject empty intermediate segments ("a//b") — almost always an attack.
+    # Trailing empty (cleaned ending with "/") is harmless.
+    for i, p in enumerate(parts):
+        if p == "" and i != len(parts) - 1:
+            raise HTTPException(status_code=400, detail="Invalid path")
     return cleaned
+
+
+def _resolve_under_storage(rel: str) -> Path:
+    """Resolve `rel` against STORAGE_ROOT and assert the result stays inside.
+    Walks symlinks. Use this whenever you're about to read/write/delete a file
+    constructed from user input — the lexical _sanitize_path can't catch
+    attacks like a symlink under a user dir pointing at /etc/passwd."""
+    rel = _sanitize_path(rel)
+    target = (STORAGE_ROOT / rel).resolve()
+    storage_resolved = STORAGE_ROOT.resolve()
+    try:
+        target.relative_to(storage_resolved)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path") from None
+    return target
 
 
 async def _file_row_to_info(row) -> FileInfo:
@@ -750,15 +811,23 @@ async def upload_file(
     # Determine mime type
     mime = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
 
-    # Build destination
-    dest_dir = STORAGE_ROOT / clean if clean else STORAGE_ROOT
+    # Build + resolve destination dir to prevent symlink-escape attacks where
+    # a previously-created subdir is a symlink pointing outside STORAGE_ROOT.
+    dest_dir = _resolve_under_storage(clean) if clean else STORAGE_ROOT.resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / f"{file_id}_{file.filename}"
+    # Sanitize filename — strip path separators that some clients might leak in.
+    safe_filename = (file.filename or "unknown").replace("/", "_").replace("\\", "_")
+    dest_path = dest_dir / f"{file_id}_{safe_filename}"
 
     # Stream file to disk in chunks, computing checksum
     sha256 = hashlib.sha256()
     total_size = 0
     chunk_size = 1024 * 1024  # 1 MB
+    # Mid-stream disk-full check cadence: every 64 MB. The pre-flight catches
+    # the easy case; this catches a slow drip of concurrent uploads filling the
+    # disk during a multi-GB transfer.
+    disk_check_interval = 64 * 1024 * 1024
+    next_disk_check = disk_check_interval
 
     try:
         with open(dest_path, "wb") as f:
@@ -777,11 +846,26 @@ async def upload_file(
                     )
                 sha256.update(chunk)
                 f.write(chunk)
+                if total_size >= next_disk_check:
+                    next_disk_check += disk_check_interval
+                    if ugh_modules.is_disk_full():
+                        f.close()
+                        dest_path.unlink(missing_ok=True)
+                        raise HTTPException(
+                            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                            detail="Device filled up during upload. Free space and retry.",
+                        )
     except HTTPException:
         raise
     except Exception as exc:
         dest_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Upload failed: {exc}") from exc
+
+    # Reject empty files — they're almost always client-side errors and they
+    # trigger latent bugs downstream (HLS transcode of a 0-byte file, etc.).
+    if total_size == 0:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Empty file rejected")
 
     checksum = sha256.hexdigest()
     now = datetime.now(timezone.utc).isoformat()
@@ -1337,7 +1421,12 @@ async def create_hls_token(file_id: str, _user: str = Depends(require_auth)):
         raise HTTPException(status_code=404, detail="HLS output missing on disk")
 
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    # 12h gives easy headroom for back-to-back movie playback on a single
+    # token. Tokens are path-scoped to one file_id and one-shot in the sense
+    # that AVPlayer requests them per session, so the longer expiry trades a
+    # small amount of cleanup latency for a much better playback UX (no token
+    # expiry mid-stream → silent AVPlayer failure).
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=12)
 
     db = await get_db()
     await db.execute(

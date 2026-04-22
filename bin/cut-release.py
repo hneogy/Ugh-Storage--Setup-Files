@@ -15,10 +15,26 @@ Usage:
   bin/cut-release.py 2.1.0 --notes "Bumps Navidrome to 0.55.0"
   bin/cut-release.py 2.1.0 --notes-file RELEASES.md --dry-run
   bin/cut-release.py 2.1.0 --no-push    # local-only, no git push
+  bin/cut-release.py 2.1.0 --public-repo /path/to/Ugh-Storage--Setup-Files
 
 The signing key is read from ~/.ugh-signing.key (base64-encoded Ed25519 seed)
 or the path in UGH_SIGNING_KEY_PATH. Generate it once with
 bin/generate-signing-key.py.
+
+Two-repo workflow:
+  The private `ughstorage` repo is where dev happens. The public
+  `Ugh-Storage--Setup-Files` repo is what user Pis clone + git-pull from.
+  When --public-repo is set, the release is also published there:
+
+    - server/, bin/, edge-functions/ are copied over (local artifacts
+      like __pycache__ and venv/ stripped)
+    - the same signed manifest + VERSION land on public's main
+    - v<version> tag is created on public
+    - public's `stable` branch is fast-forwarded so the manifest URL
+      raw.githubusercontent.com/<you>/<public>/stable/server/manifest.json
+      points at the new release
+
+  The public-repo path can also come from env: UGH_PUBLIC_REPO_PATH.
 """
 
 from __future__ import annotations
@@ -28,6 +44,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -59,13 +76,76 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(cmd, cwd=REPO_ROOT, text=True,
+def run(cmd: list[str], *, check: bool = True, capture: bool = False,
+        cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(cmd, cwd=cwd or REPO_ROOT, text=True,
                             capture_output=capture, check=False)
     if check and result.returncode != 0:
         out = (result.stderr or result.stdout or "").strip()
         fail(f"command failed: {' '.join(cmd)}\n{out}")
     return result
+
+
+def publish_to_public(public_repo: Path, version: str, stable_branch: str, push: bool) -> None:
+    """Mirror the release to the public setup repo (Ugh-Storage--Setup-Files).
+
+    Copies server/, bin/, edge-functions/ from this checkout (stripped of
+    __pycache__ / venv), commits on the public repo's main, tags v<version>,
+    fast-forwards <stable_branch>, pushes if push=True."""
+    if not (public_repo / ".git").exists():
+        fail(f"--public-repo {public_repo} is not a git checkout")
+
+    # Refuse to publish to a dirty public checkout — we'd mix operator work
+    # into the release commit otherwise.
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=public_repo, text=True, capture_output=True, check=False,
+    ).stdout.strip()
+    if dirty:
+        fail(f"--public-repo {public_repo} has uncommitted changes; clean it first\n{dirty}")
+
+    # Make sure we're on main + up to date so the push fast-forwards cleanly.
+    run(["git", "checkout", "main"], cwd=public_repo)
+    run(["git", "pull", "--ff-only", "origin", "main"], cwd=public_repo)
+
+    # Mirror the three published top-level paths. Server/ is the one that
+    # actually matters for the Pi; bin/ and edge-functions/ are published
+    # for auditability (and so people can follow along with your release
+    # process without access to the private repo).
+    for path in ("server", "bin", "edge-functions"):
+        src = REPO_ROOT / path
+        dst = public_repo / path
+        if not src.exists():
+            continue
+        # Nuke + replace — cleanest way to pick up deletions.
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(
+            src, dst,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "venv", ".venv"),
+        )
+
+    run(["git", "add", "server", "bin", "edge-functions"], cwd=public_repo)
+
+    # Nothing to commit? The release might have had no code changes (pure
+    # manifest bump). Skip the commit but still tag.
+    committed = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=public_repo, check=False,
+    ).returncode != 0
+    if committed:
+        run(["git", "commit", "-m", f"Release {version}"], cwd=public_repo)
+
+    git_ref = f"v{version}"
+    run(["git", "tag", "-f", git_ref], cwd=public_repo)
+
+    if not push:
+        print(f"  public: tag {git_ref} created locally at {public_repo}; not pushed (--no-push)")
+        return
+
+    run(["git", "push", "origin", "main", git_ref], cwd=public_repo)
+    run(["git", "push", "origin", f"main:{stable_branch}", "--force-with-lease"], cwd=public_repo)
+    print(f"  public: pushed {git_ref} + fast-forwarded {stable_branch}")
 
 
 def ensure_clean_tree_on_main() -> None:
@@ -126,6 +206,10 @@ def main() -> int:
                     help="print what would happen; change nothing")
     ap.add_argument("--stable-branch", default="stable",
                     help="branch to fast-forward to the new tag (default: stable)")
+    ap.add_argument("--public-repo", default=os.environ.get("UGH_PUBLIC_REPO_PATH"),
+                    help="path to a checkout of the public Ugh-Storage--Setup-Files "
+                         "repo; release is also published there when set (or via "
+                         "UGH_PUBLIC_REPO_PATH env)")
     args = ap.parse_args()
 
     if not re.match(r"^\d+\.\d+\.\d+", args.version):
@@ -191,12 +275,25 @@ def main() -> int:
 
     run(["git", "push", "origin", "main", git_ref])
     # Fast-forward the stable branch to this tag so the manifest URL
-    # (https://raw.githubusercontent.com/<you>/ughstorage/stable/server/manifest.json)
     # updates without needing a separate stable commit.
     run(["git", "push", "origin", f"main:{args.stable_branch}", "--force-with-lease"])
 
     print(f"Pushed {git_ref} + fast-forwarded {args.stable_branch}.")
-    print("Devices polling the manifest will pick this up within one check cycle.")
+
+    # Mirror to the public setup repo if configured. This is what user Pis
+    # actually git-pull from during OTA, so skipping it means your release
+    # never reaches end users.
+    if args.public_repo:
+        public_path = Path(args.public_repo).expanduser().resolve()
+        print(f"\nPublishing to public repo at {public_path}")
+        publish_to_public(public_path, args.version, args.stable_branch, push=True)
+    else:
+        print("\nNote: --public-repo not set. This release is only in the private repo.")
+        print("      User Pis clone from the public repo and won't see this update.")
+        print("      Re-run with --public-repo /path/to/Ugh-Storage--Setup-Files")
+        print("      (or set UGH_PUBLIC_REPO_PATH) to publish to both.")
+
+    print("\nDevices polling the manifest will pick this up within one check cycle.")
     return 0
 
 

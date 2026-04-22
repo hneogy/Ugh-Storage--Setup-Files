@@ -13,6 +13,7 @@ Output layout:
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -26,6 +27,13 @@ HLS_VARIANT_HEIGHT = 720
 HLS_VARIANT_BITRATE = "2500k"
 HLS_AUDIO_BITRATE = "128k"
 HLS_SEGMENT_SECONDS = 6
+
+# Pi 5 has 4 performance cores. Two concurrent ffmpeg workers at -veryfast keeps
+# the device responsive (uvicorn, Caddy, BLE service) while still draining the
+# transcode queue at a reasonable rate. Without this, an upload burst spawns
+# one ffmpeg per video and the box becomes unresponsive.
+HLS_TRANSCODE_CONCURRENCY = int(os.getenv("UGHSTORAGE_HLS_CONCURRENCY", "2"))
+_hls_semaphore = asyncio.Semaphore(HLS_TRANSCODE_CONCURRENCY)
 
 
 def hls_dir(file_id: str) -> Path:
@@ -60,11 +68,32 @@ async def transcode_video_to_hls(file_id: str, source: Path) -> None:
     """Transcode a single video to an HLS variant. Updates hls_status in DB
     as it progresses. Designed to run as a fire-and-forget background task —
     callers should not await anything dependent on this returning.
+
+    Bounded by `_hls_semaphore` (default 2 concurrent) so a burst of video
+    uploads doesn't fork enough ffmpeg processes to thrash the Pi.
     """
+    # Reject empty / vanished source files before we acquire the semaphore so
+    # we don't waste a slot on a guaranteed failure.
+    try:
+        if not source.exists() or source.stat().st_size == 0:
+            await _set_status(file_id, "failed", "source missing or empty")
+            return
+    except OSError as exc:
+        await _set_status(file_id, "failed", f"source stat failed: {exc}")
+        return
+
     if await _is_encrypted_upload(source):
         await _set_status(file_id, "unsupported", "encrypted upload")
         return
 
+    # Mark queued so iOS can show "waiting in transcode queue" rather than the
+    # generic "pending" while another video is hogging the semaphore.
+    await _set_status(file_id, "queued")
+    async with _hls_semaphore:
+        await _transcode_video_to_hls_inner(file_id, source)
+
+
+async def _transcode_video_to_hls_inner(file_id: str, source: Path) -> None:
     dest_dir = hls_dir(file_id)
     variant_dir = dest_dir / "v0"
 

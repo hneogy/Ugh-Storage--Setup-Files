@@ -67,7 +67,14 @@ MANIFEST_PUBLIC_KEY_B64 = os.getenv(
     "UGHSTORAGE_UPDATE_PUBLIC_KEY",
     "zZfwKtXdrY0N88hoTp9cp9THoNTWwfjNML8qE9hlrB8=",
 ).strip()
-REQUIRE_SIGNATURE = os.getenv("UGHSTORAGE_UPDATE_REQUIRE_SIGNATURE", "0") == "1"
+
+
+def _require_signature_now() -> bool:
+    """Read REQUIRE_SIGNATURE at call time so a .env edit + service reload
+    takes effect without rebuilding. Reading a constant at import time meant
+    `UGHSTORAGE_UPDATE_REQUIRE_SIGNATURE=1` set after install was ignored
+    until the next restart that happened to re-import this module."""
+    return os.getenv("UGHSTORAGE_UPDATE_REQUIRE_SIGNATURE", "0") == "1"
 
 # Valid states the script writes into update-state.json. iOS mirrors these.
 UPDATE_STATES = {
@@ -182,7 +189,7 @@ async def fetch_manifest() -> dict[str, Any] | None:
 
     trusted, reason = verify_manifest_signature(manifest)
     if not trusted:
-        if REQUIRE_SIGNATURE:
+        if _require_signature_now():
             logger.warning("Manifest rejected (REQUIRE_SIGNATURE=1): %s", reason)
             return None
         # Soft mode: accept on HTTPS trust but log so devops can spot drift.
@@ -269,25 +276,33 @@ async def trigger_update(target_git_ref: str) -> dict[str, Any]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Write a "starting" state so iOS sees progress immediately, even before
-    # the script's first write.
+    # the script's first write. Atomic write so a crashed write doesn't leave
+    # a partial file that the iOS poll sees as "idle" (defaulted on parse error).
     initial = {
         "state": "starting",
         "target_git_ref": target_git_ref,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "message": "Update requested",
     }
-    STATE_FILE.write_text(json.dumps(initial))
+    tmp_state = STATE_FILE.with_suffix(".tmp")
+    tmp_state.write_text(json.dumps(initial))
+    os.replace(tmp_state, STATE_FILE)
 
     # Detached: start_new_session so this survives the parent (uvicorn) restart.
-    # stdout/stderr swallowed — the script logs to journalctl via systemd's
-    # logger or to its own log file if run under systemd-run. For our first
-    # cut we keep it simple: redirect to a rolling log under /var/lib.
     log_file = STATE_DIR / "update.log"
-    await asyncio.create_subprocess_exec(
-        "/bin/bash", str(UPDATE_SCRIPT), target_git_ref,
-        cwd=str(SERVER_DIR),
-        stdout=log_file.open("ab"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    log_fh = log_file.open("ab")
+    try:
+        await asyncio.create_subprocess_exec(
+            "/bin/bash", str(UPDATE_SCRIPT), target_git_ref,
+            cwd=str(SERVER_DIR),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        # Child inherits the fd; close ours so we don't leak.
+        try:
+            log_fh.close()
+        except Exception:
+            pass
     return initial

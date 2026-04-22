@@ -27,12 +27,18 @@ VENV_PIP="$SERVER_DIR/venv/bin/pip"
 mkdir -p "$STATE_DIR"
 
 # write_state <state> <message>
-# Safely writes the JSON state file using python3 with env vars (avoids
-# heredoc escaping hazards with user-supplied message text).
+# Atomically writes the JSON state file. Tries python3 first (proper JSON
+# escaping for arbitrary message text); if python3 is broken or fails,
+# falls back to a hand-rolled JSON write so iOS still sees update progress.
+# Atomic via temp file + mv so a crashed half-write never lands.
 write_state() {
-    STATE_VALUE="$1" STATE_MSG="${2:-}" STATE_REF="$TARGET_REF" STATE_FILE="$STATE_FILE" \
-    python3 - <<'PY'
-import json, os
+    local _state="$1"
+    local _msg="${2:-}"
+    local _tmp="${STATE_FILE}.tmp.$$"
+
+    if STATE_VALUE="$_state" STATE_MSG="$_msg" STATE_REF="$TARGET_REF" TMP_FILE="$_tmp" \
+        python3 - <<'PY' 2>>"$STATE_DIR/update.log"
+import json, os, sys
 from datetime import datetime, timezone
 data = {
     "state": os.environ["STATE_VALUE"],
@@ -40,9 +46,27 @@ data = {
     "updated_at": datetime.now(timezone.utc).isoformat(),
     "message": os.environ["STATE_MSG"],
 }
-with open(os.environ["STATE_FILE"], "w") as f:
+with open(os.environ["TMP_FILE"], "w") as f:
     json.dump(data, f)
+sys.exit(0)
 PY
+    then
+        mv -f "$_tmp" "$STATE_FILE"
+        return 0
+    fi
+
+    # Python failed — fall back to a hand-built JSON object. We escape only
+    # the few characters that could break JSON in the message string.
+    local _esc_msg
+    _esc_msg=$(printf '%s' "$_msg" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g' -e 's/\r/\\r/g' -e 's/\t/\\t/g')
+    local _esc_ref
+    _esc_ref=$(printf '%s' "$TARGET_REF" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    local _now
+    _now=$(date -u +"%Y-%m-%dT%H:%M:%S.000000+00:00")
+    cat > "$_tmp" <<EOF
+{"state":"$_state","target_git_ref":"$_esc_ref","updated_at":"$_now","message":"$_esc_msg"}
+EOF
+    mv -f "$_tmp" "$STATE_FILE"
 }
 
 rollback() {

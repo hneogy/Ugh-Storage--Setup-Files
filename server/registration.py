@@ -273,6 +273,18 @@ async def factory_reset() -> None:
     except Exception:
         logger.exception("Error stopping cloudflared service")
 
+    # 2a. Stop any installed module services (music/photos/video). Without this,
+    # Navidrome / Immich / Jellyfin would keep running on the LAN exposing the
+    # previous user's data even after the device is "factory reset". We don't
+    # uninstall the modules — just stop the services. The next owner can choose
+    # to install them or run uninstall_*.sh manually.
+    for unit in ("ugh-module-music.service", "ugh-module-photos.service", "ugh-module-video.service"):
+        try:
+            await _run_cmd("sudo", "systemctl", "stop", unit, check=False)
+            logger.info("Stopped %s", unit)
+        except Exception:
+            logger.exception("Error stopping %s", unit)
+
     # 3. Clear DEVICE_ID and DEVICE_SHARED_SECRET from .env
     try:
         keys_to_remove = {"UGHSTORAGE_DEVICE_ID", "UGHSTORAGE_DEVICE_SHARED_SECRET", "UGHSTORAGE_TUNNEL_TOKEN"}
@@ -300,51 +312,61 @@ async def factory_reset() -> None:
 
 
 async def send_heartbeat() -> dict:
-    """Send a heartbeat to Supabase with the Pi's online status and storage stats.
+    """Send a heartbeat to Supabase with the Pi's online status + storage stats.
+
+    Routes through the `heartbeat` Edge Function rather than PostgREST because
+    the `devices` table's RLS policy gates UPDATE on `auth.uid() = owner_id`
+    and the Pi has no Supabase user session to satisfy that — every direct
+    PATCH is rejected silently. The edge function validates the Pi's
+    `DEVICE_SHARED_SECRET` against the row and uses the service role internally
+    to bypass RLS after the secret matches.
 
     Returns:
-        The JSON response from Supabase.
+        The JSON response from the edge function.
+    Raises:
+        RuntimeError on any non-200 result; the caller (the heartbeat loop
+        in main.py) logs + swallows so one bad beat doesn't kill the loop.
     """
     if not config.DEVICE_ID or not config.DEVICE_SHARED_SECRET:
         raise RuntimeError("Device not registered")
 
-    # Gather storage stats
+    # Gather storage stats. Only columns that exist in the `devices` table
+    # are sent; PostgREST — and the edge function — both reject unknown
+    # columns with 400.
     try:
         usage = shutil.disk_usage(str(config.STORAGE_ROOT))
-        storage_stats = {
-            "storage_total": usage.total,
-            "storage_used": usage.used,
-            "storage_free": usage.free,
-        }
+        storage_total = usage.total
+        storage_used = usage.used
     except Exception:
-        storage_stats = {
-            "storage_total": 0,
-            "storage_used": 0,
-            "storage_free": 0,
-        }
+        storage_total = 0
+        storage_used = 0
 
-    url = f"{config.SUPABASE_URL}/rest/v1/devices"
+    url = f"{config.SUPABASE_URL}/functions/v1/heartbeat"
+    # Anon key in the Authorization header lets the request through Supabase's
+    # API gateway; the real auth (shared_secret) lives in the body. Without
+    # the anon key the gateway rejects with 401 before the function ever runs.
     headers = {
         "apikey": config.SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation",
     }
-    params = {"id": f"eq.{config.DEVICE_ID}"}
     payload = {
-        "last_seen_at": datetime.now(timezone.utc).isoformat(),
-        "storage_total": storage_stats["storage_total"],
-        "storage_used": storage_stats["storage_used"],
-        "storage_free": storage_stats["storage_free"],
+        "device_id": config.DEVICE_ID,
+        "shared_secret": config.DEVICE_SHARED_SECRET,
+        "storage_total": storage_total,
+        "storage_used": storage_used,
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.patch(url, headers=headers, params=params, json=payload) as resp:
-            if resp.status not in (200, 204):
-                body = await resp.text()
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            body_text = await resp.text()
+            if resp.status != 200:
                 raise RuntimeError(
-                    f"Heartbeat failed (HTTP {resp.status}): {body}"
+                    f"Heartbeat failed (HTTP {resp.status}): {body_text}"
                 )
-            if resp.status == 200:
-                return await resp.json()
-            return {"status": "ok"}
+            try:
+                import json as _json
+                return _json.loads(body_text)
+            except Exception:
+                return {"ok": True}

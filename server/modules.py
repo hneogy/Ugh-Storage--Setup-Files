@@ -22,14 +22,17 @@ Design choices:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Iterator, Literal, Optional
 
 import aiohttp
 from pydantic import BaseModel
@@ -282,13 +285,65 @@ class ModuleLifecycleStatus(BaseModel):
     message: Optional[str] = None
 
 
-def _read_lifecycle() -> dict[str, dict[str, Any]]:
+# --- Module-state file: atomic, locked I/O ---
+#
+# The shell scripts (install_*.sh, uninstall_*.sh, update.sh) and the FastAPI
+# process all update modules-state.json. Without locking, two writers can clobber
+# each other (last-write-wins) and a concurrent reader can observe a half-written
+# file. We use a sibling lockfile + flock + atomic-rename writes so the file is
+# always coherent, and the lifecycle "is something already in flight?" check is
+# wrapped in the same critical section as the write that follows it (closes a
+# TOCTOU race that would otherwise allow two parallel install scripts to spawn).
+
+_LOCK_PATH = MODULE_STATE_FILE.with_suffix(".lock")
+
+
+@contextlib.contextmanager
+def _state_lock() -> Iterator[None]:
+    """Cross-process exclusive lock around modules-state.json reads/writes.
+    Shell scripts use `flock` on the same file — both honor each other."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _read_lifecycle_unlocked() -> dict[str, dict[str, Any]]:
     try:
         with MODULE_STATE_FILE.open("r") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _read_lifecycle() -> dict[str, dict[str, Any]]:
+    with _state_lock():
+        return _read_lifecycle_unlocked()
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON via tempfile + rename so a reader never sees a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".modules-state-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def lifecycle_for(module_id: ModuleId) -> ModuleLifecycleStatus:
@@ -304,44 +359,78 @@ def lifecycle_for(module_id: ModuleId) -> ModuleLifecycleStatus:
 
 
 def _write_lifecycle(module_id: ModuleId, **fields: Any) -> None:
-    """Merge-update this module's entry in the shared state file."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    data = _read_lifecycle()
-    entry = data.get(module_id, {})
-    entry.update(fields)
-    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-    data[module_id] = entry
-    MODULE_STATE_FILE.write_text(json.dumps(data))
+    """Merge-update this module's entry in the shared state file. Lock-and-RMW
+    so concurrent writers never clobber each other."""
+    with _state_lock():
+        data = _read_lifecycle_unlocked()
+        entry = data.get(module_id, {})
+        entry.update(fields)
+        entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+        data[module_id] = entry
+        _atomic_write_json(MODULE_STATE_FILE, data)
 
 
 async def spawn_lifecycle_script(module_id: ModuleId, action: Literal["install", "uninstall"]) -> ModuleLifecycleStatus:
     """Run `<action>_<module_id>.sh` as a detached process so the lifecycle
     survives the main uvicorn restart. Refuses to spawn if an action is
-    already in flight for this module."""
-    existing = lifecycle_for(module_id)
-    if existing.state in ("installing", "uninstalling"):
-        return existing  # already in flight — iOS polls status
+    already in flight for this module.
 
+    The check-and-claim is performed under the state lock so two concurrent
+    requests can't both observe `idle` and each spawn a script."""
     script_name = f"{action}_{module_id}.sh"
     script_path = SERVER_DIR / script_name
-    if not script_path.exists():
-        _write_lifecycle(module_id, state="failed",
-                         step=None, message=f"{script_name} not found")
-        return lifecycle_for(module_id)
 
-    # Write initial state before forking so iOS sees progress immediately.
     initial_state: ModuleLifecycleState = "installing" if action == "install" else "uninstalling"
-    _write_lifecycle(module_id, state=initial_state,
-                     step="Starting", message=None)
+
+    # Atomic check-then-claim under the state lock.
+    with _state_lock():
+        data = _read_lifecycle_unlocked()
+        existing = data.get(module_id, {})
+        existing_state = existing.get("state", "idle")
+        if existing_state in ("installing", "uninstalling"):
+            return ModuleLifecycleStatus(
+                module=module_id,
+                state=existing_state,
+                updated_at=existing.get("updated_at"),
+                step=existing.get("step"),
+                message=existing.get("message"),
+            )
+        if not script_path.exists():
+            data[module_id] = {
+                "state": "failed",
+                "step": None,
+                "message": f"{script_name} not found",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _atomic_write_json(MODULE_STATE_FILE, data)
+            return ModuleLifecycleStatus(
+                module=module_id, state="failed", message=f"{script_name} not found",
+                updated_at=data[module_id]["updated_at"],
+            )
+        data[module_id] = {
+            "state": initial_state,
+            "step": "Starting",
+            "message": None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _atomic_write_json(MODULE_STATE_FILE, data)
 
     log_file = STATE_DIR / f"module-{module_id}-{action}.log"
-    await asyncio.create_subprocess_exec(
-        "/bin/bash", str(script_path),
-        cwd=str(SERVER_DIR),
-        stdout=log_file.open("ab"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
+    log_fh = log_file.open("ab")
+    try:
+        await asyncio.create_subprocess_exec(
+            "/bin/bash", str(script_path),
+            cwd=str(SERVER_DIR),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        # The child process inherits the fd; close ours so we don't leak.
+        try:
+            log_fh.close()
+        except Exception:
+            pass
     return lifecycle_for(module_id)
 
 
@@ -352,6 +441,10 @@ async def spawn_lifecycle_script(module_id: ModuleId, action: Literal["install",
 
 _usage_cache: tuple[float, dict[str, int]] | None = None
 _USAGE_CACHE_TTL_SECS = 60.0
+# usage_breakdown() runs sync (FastAPI threadpool) — a threading lock keeps two
+# scans from running in parallel and clobbering each other's cache fill.
+import threading as _threading
+_usage_cache_lock = _threading.Lock()
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -382,9 +475,22 @@ def usage_breakdown() -> dict[str, int]:
     """
     global _usage_cache
     now = time.time()
-    if _usage_cache and now - _usage_cache[0] < _USAGE_CACHE_TTL_SECS:
-        return _usage_cache[1]
+    cached = _usage_cache
+    if cached and now - cached[0] < _USAGE_CACHE_TTL_SECS:
+        return cached[1]
 
+    with _usage_cache_lock:
+        # Re-check inside the lock — another thread may have refreshed while we waited.
+        cached = _usage_cache
+        now = time.time()
+        if cached and now - cached[0] < _USAGE_CACHE_TTL_SECS:
+            return cached[1]
+        return _compute_usage_breakdown_locked(now)
+
+
+def _compute_usage_breakdown_locked(now: float) -> dict[str, int]:
+    """Inner: actually walk the filesystem. Caller holds _usage_cache_lock."""
+    global _usage_cache
     import shutil
     total, _used, free = shutil.disk_usage(str(STORAGE_ROOT))
 
